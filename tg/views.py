@@ -1,9 +1,11 @@
 import curses
 import logging
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 from tempfile import NamedTemporaryFile
 import shlex
+import subprocess
 
 from _curses import window  # type: ignore
 
@@ -29,6 +31,7 @@ MULTICHAR_KEYBINDINGS = (
     "bp",
 )
 
+IMAGE_CACHE = {}
 
 class Win:
     """Proxy for win object to log error and continue working"""
@@ -427,11 +430,13 @@ class MsgView:
             url += f"\n | {description}"
         return url, True
 
-    def _format_msg(self, msg_proxy: MsgProxy, width_limit: int) -> Tuple[str, bool, bool, bool, bool]:
+    def _format_msg(self, msg_proxy: MsgProxy, width_limit: int) -> Tuple[Union[str,bytes], bool, bool, bool, bool]:
         is_reply = False
         msg = self._parse_msg(msg_proxy)
         is_media = not msg_proxy.is_text
         is_me =  self.model.is_me(msg_proxy["sender_id"].get("user_id"))
+        if isinstance(msg, bytes):
+            return msg, False, False,is_media, is_me
         if caption := msg_proxy.caption:
             msg += "\n" + caption.replace("\n", " ")
         msg_fmt, is_url = self._format_url(msg_proxy)
@@ -470,7 +475,7 @@ class MsgView:
         current_msg_idx: int,
         msgs: List[Tuple[int, Dict[str, Any]]],
         min_msg_padding: int,
-    ) -> List[Tuple[Tuple[str, ...], bool, bool, bool, bool, bool, int]]:
+    ) -> List[Tuple[Tuple[Union[str,bytes], ...], bool, bool, bool, bool, bool, int]]:
         """
         Tries to collect list of messages that will satisfy `min_msg_padding`
         theshold. Long messages could prevent other messages from displaying on
@@ -480,7 +485,7 @@ class MsgView:
         message could be visible on the screen.
         """
         selected_item_idx: Optional[int] = None
-        collected_items: List[Tuple[Tuple[str, ...], bool, bool, bool, bool, bool, int]] = []
+        collected_items: List[Tuple[Tuple[Union[str,bytes], ...], bool, bool, bool, bool, bool, int]] = []
         for ignore_before in range(len(msgs)):
             if selected_item_idx is not None:
                 break
@@ -503,34 +508,38 @@ class MsgView:
                 msg, is_url, is_reply, is_media, is_me = self._format_msg(
                     msg_proxy, width_limit=self.w - label_len - 1
                 )
-                elements = *label_elements, f" {msg}"
-                needed_lines = 0
-                for i, msg_line in enumerate(msg.split("\n")):
-                    # count wide character utf-8 symbols that take > 1 bytes to
-                    # print it causes invalid offset
-                    line_len = string_len_dwc(msg_line)
+                if isinstance(msg, bytes):
+                    needed_lines = 5
+                    elements = *label_elements, msg
+                else:
+                    elements = *label_elements, f" {msg}"
+                    needed_lines = 0
+                    for i, msg_line in enumerate(msg.split("\n")):
+                        # count wide character utf-8 symbols that take > 1 bytes to
+                        # print it causes invalid offset
+                        line_len = string_len_dwc(msg_line)
 
-                    # first line cotains msg lable, e.g user name, date
-                    if i == 0:
-                        line_len += label_len
+                        # first line cotains msg lable, e.g user name, date
+                        if i == 0:
+                            line_len += label_len
 
-                    needed_lines += (line_len // self.w) + 1
+                        needed_lines += (line_len // self.w) + 1
 
-                line_num -= needed_lines
-                if line_num < 0:
-                    tail_lines = needed_lines + line_num - 1
-                    # try preview long message that did fit in the screen
-                    if tail_lines > 0 and not is_selected_msg:
-                        limit = self.w * tail_lines
-                        tail_chatacters = len(msg) - limit - 3
-                        elements = (
-                            "",
-                            "",
-                            "",
-                            f" ...{msg[tail_chatacters:]}",
-                        )
-                        collected_items.append((elements, is_selected_msg, is_url, is_reply, is_media, is_me, 0))
-                    break
+                    line_num -= needed_lines
+                    if line_num < 0:
+                        tail_lines = needed_lines + line_num - 1
+                        # try preview long message that did fit in the screen
+                        if tail_lines > 0 and not is_selected_msg:
+                            limit = self.w * tail_lines
+                            tail_chatacters = len(msg) - limit - 3
+                            elements = (
+                                "",
+                                "",
+                                "",
+                                f" ...{msg[tail_chatacters:]}",
+                            )
+                            collected_items.append((elements, is_selected_msg, is_url, is_reply, is_media, is_me, 0))
+                        break
                 collected_items.append((elements, is_selected_msg, is_url, is_reply, is_media, is_me, line_num))
                 if is_selected_msg:
                     selected_item_idx = len(collected_items) - 1
@@ -562,11 +571,16 @@ class MsgView:
 
         for elements, selected, is_url, is_reply, is_media, is_me, line_num in msgs_to_draw:
             column = 0
-            user = elements[1]
+            user: str = elements[1]
             for attr, elem in zip(
                 self._msg_attributes(selected, is_url, is_reply, is_media, is_me, user), elements
             ):
                 if not elem:
+                    continue
+                elif isinstance(elem, bytes):
+                    self.win.addstr(line_num, column, "", attr)
+                    sys.stdout.buffer.write(elem)
+                    line_num += 5
                     continue
                 lines = (column + string_len_dwc(elem)) // self.w
                 last_line = self.h == line_num + lines
@@ -647,9 +661,9 @@ class MsgView:
             return tuple(attr | underline | bold for attr in attrs)
         return attrs
 
-    def _parse_msg(self, msg: MsgProxy) -> str:
+    def _parse_msg(self, msg: MsgProxy) -> Union[str,bytes]:
         if msg.is_message:
-            return parse_content(msg, self.model.users)
+            return parse_content(msg, self.model.users, allow_image=True)
         log.debug("Unknown message type: %s", msg)
         return "unknown msg type: " + str(msg["content"])
 
@@ -679,7 +693,7 @@ def get_date(chat: Dict[str, Any]) -> str:
     return dt.strftime(date_fmt)
 
 
-def parse_content(msg: MsgProxy, users: UserModel) -> str:
+def parse_content(msg: MsgProxy, users: UserModel, allow_image: bool = False) -> Union[str, bytes]:
     if msg.is_text:
         return msg.text_content.replace("\n", " ")
 
@@ -715,9 +729,10 @@ def parse_content(msg: MsgProxy, users: UserModel) -> str:
         for option in msg.poll_options:
             content_text += f"\n * {option['voter_count']} ({option['vote_percentage']}%) | {option['text']}"
 
+    download = get_download(msg.local, msg.size)
     fields = dict(
         name=msg.file_name,
-        download=get_download(msg.local, msg.size),
+        download=download,
         size=msg.human_size,
         duration=msg.duration,
         listened=format_bool(msg.is_listened),
@@ -727,6 +742,18 @@ def parse_content(msg: MsgProxy, users: UserModel) -> str:
         closed=msg.is_closed_poll,
     )
     info = ", ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+
+    if msg.content_type == "photo" and download == "yes" and config.VIEW_IMAGE_CMD and allow_image:
+        filename = msg.local_path
+        if filename in IMAGE_CACHE:
+            return IMAGE_CACHE[filename]
+        proc = subprocess.run(f"{config.VIEW_IMAGE_CMD} {filename}", capture_output= True, shell=True)
+        if proc.returncode == 0:
+            IMAGE_CACHE[filename] = proc.stdout
+            return proc.stdout
+        else:
+            return f"[{msg.content_type} (preview failed): {info}]{content_text}"
+
 
     return f"[{msg.content_type}: {info}]{content_text}"
 
